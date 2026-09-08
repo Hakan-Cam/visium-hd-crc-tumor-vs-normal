@@ -26,8 +26,8 @@ regularly spaced normal crypts:
 composition breakdown (top 7 cell types + other) shows epithelium and
 stroma occupying distinct, spatially coherent regions rather than a
 speckled or random mix, with the sparser immune populations (Plasma,
-Myeloid, TNKILC, B, Mast) concentrated in pockets rather than smeared
-uniformly across the tissue:
+Myeloid, TNKILC*, B, Mast) concentrated in pockets rather than smeared
+uniformly across the tissue (* T cells, NK (Natural Killer) cells, and ILCs (Innate Lymphoid Cells):
 
 ![Per-bin cell-type composition, scatterpie](docs/img/celltype_scatterpie.png)
 
