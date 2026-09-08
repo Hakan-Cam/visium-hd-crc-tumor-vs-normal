@@ -61,7 +61,7 @@ result below).
 
 | Cluster | Color | Tissue / cell type | Marker genes |
 |---|---|---|---|
-| 0 | blue | **Tumor** | CDH1, CEACAM5, EPCAM, KRT8, KRT20 |
+| 0 | blue | **Tumor** | CDH1, CEACAM5, CEACAM6, EPCAM, KRT8, KRT20 |
 | 1 | red | Epithelium (2nd subpopulation) | KRT19 |
 | 2 | green | Smooth muscle (muscularis) | ACTA2, MYH11 |
 | 3 | purple | Endothelium + fibroblast | CLDN5, PECAM1, VWF, DCN |
@@ -71,11 +71,18 @@ result below).
 | 10 | lavender | B cells + T cells | MS4A1, CD2 |
 
 Clusters 5, 7, 8, 11-17 had no significant hit among the 26 canonical genes
-tested and aren't labeled here. *Cluster 0 is labeled "Tumor" here for
-readability -- what the marker genes actually confirm is epithelium; the
-same epithelial marker set is also present in the normal-adjacent sample
-(healthy colon lining), just as a much smaller share of bins (~0.5% of the
-image vs. ~2.8% here), which is why it's left out of the table below.*
+tested and aren't labeled here. *CDH1, EPCAM, KRT8 and KRT20 confirm
+epithelium generally, not tumor specifically -- the same epithelial identity
+is present in the normal-adjacent sample's cluster 0 too, just at a much
+smaller share of bins (~0.5% of the image vs. ~2.8% here). CEACAM6 is what
+makes "Tumor" a defensible label rather than a readability shortcut: it's
+sharply specific to this cluster in the tumor sample (80% of its bins vs.
+9% elsewhere, `FindAllMarkers` adj. p ≈ 0) and isn't a significant marker
+anywhere in the normal-adjacent sample's cluster 0. [Oliveira et al.
+2025](https://www.nature.com/articles/s41588-025-02193-3), the paper this
+dataset is from, independently uses CEACAM6 as their own tumor-corroboration
+marker on this same patient (their Fig. 3c) -- which is why it's left out of
+the table below.*
 </details>
 
 <details>
