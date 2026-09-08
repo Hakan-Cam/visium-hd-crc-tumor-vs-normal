@@ -61,7 +61,7 @@ result below).
 
 | Cluster | Color | Tissue / cell type | Marker genes |
 |---|---|---|---|
-| 0 | blue | Epithelium | CDH1, CEACAM5, EPCAM, KRT8, KRT20 |
+| 0 | blue | **Tumor** | CDH1, CEACAM5, EPCAM, KRT8, KRT20 |
 | 1 | red | Epithelium (2nd subpopulation) | KRT19 |
 | 2 | green | Smooth muscle (muscularis) | ACTA2, MYH11 |
 | 3 | purple | Endothelium + fibroblast | CLDN5, PECAM1, VWF, DCN |
@@ -71,7 +71,11 @@ result below).
 | 10 | lavender | B cells + T cells | MS4A1, CD2 |
 
 Clusters 5, 7, 8, 11-17 had no significant hit among the 26 canonical genes
-tested and aren't labeled here.
+tested and aren't labeled here. *Cluster 0 is labeled "Tumor" here for
+readability -- what the marker genes actually confirm is epithelium; the
+same epithelial marker set is also present in the normal-adjacent sample
+(healthy colon lining), just as a much smaller share of bins (~0.5% of the
+image vs. ~2.8% here), which is why it's left out of the table below.*
 </details>
 
 <details>
@@ -80,7 +84,6 @@ tested and aren't labeled here.
 
 | Cluster | Color | Tissue / cell type | Marker genes |
 |---|---|---|---|
-| 0 | blue | Epithelium | CDH1, EPCAM, KRT8 |
 | 1 | red | Epithelium (2nd subpopulation) | CEACAM5, KRT19, KRT20 |
 | 2 | green | Smooth muscle (muscularis) | ACTA2, MYH11 |
 | 3 | purple | B cells + endothelium + fibroblast | CD79A, CLDN5, COL3A1 |
