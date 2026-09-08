@@ -10,9 +10,88 @@ subsetting, differential expression, and gene set enrichment.
 ## Results
 
 The real test of this pipeline is whether its output matches known
-colorectal cancer biology, not just whether the code runs. Three checks
+colorectal cancer biology, not just whether the code runs. Four checks
 from one full run, summarized here -- the complete figures land in
 `output/figures/` after running the notebook yourself.
+
+**Unsupervised clustering, run independently per sample, already separates
+real tissue structure before any cell-type label exists.** Sketch-based
+Louvain clustering (Section 5) -- no single-cell integration, no
+reference, just each sample's own 8µm-bin expression -- recovers spatially
+coherent domains that line up with real histology: a solid block driven by
+smooth-muscle genes traces the muscularis, separate epithelial clusters
+trace the crypts/glands, and the tumor sample's dominant epithelial region
+shows the irregular, cribriform (gland-in-gland) architecture typical of
+adenocarcinoma, next to the regularly spaced, uniform crypts on the
+normal-adjacent side:
+
+<table>
+<tr>
+<td width="50%"><img src="docs/img/tumor_spatial_clusters.png" alt="Tumor sample, sketch-based unsupervised clustering" /></td>
+<td width="50%"><img src="docs/img/normal_spatial_clusters.png" alt="Normal-adjacent sample, sketch-based unsupervised clustering" /></td>
+</tr>
+<tr>
+<td align="center"><sub><b>P5_Tumor</b></sub></td>
+<td align="center"><sub><b>P5_NormalAdjacent</b></sub></td>
+</tr>
+</table>
+
+*Sketch-based analysis of Visium HD data without integration of single-cell
+data. Spatial plots with 8µm bins colored by unsupervised ("level 1")
+clustering, run separately per sample. Cell-type labels in the tables below
+are assigned post hoc from canonical marker genes (`FindAllMarkers` on the
+sketch, cross-checked against a textbook colorectal/immune panel -- see
+Section 6 and the `marker-sanity-check` chunk in the notebook), not
+produced by the clustering itself.*
+
+Tumor and normal-adjacent are clustered **independently** at this stage --
+integration across samples doesn't happen until Section 7 -- so cluster
+numbers and colors are *not* comparable between the two panels: cluster 6,
+for example, is B cells in the tumor sample but fibroblast in
+normal-adjacent. Only clusters with a significant hit for at least one of
+26 canonical marker genes are labeled below; the rest are real, spatially
+distinct clusters that this coarse 7-category marker panel doesn't resolve
+on its own (full per-bin cell-type assignment comes later from RCTD
+deconvolution against a matched single-cell reference -- see the next
+result below).
+
+<details>
+<summary><b>Tumor (P5_Tumor) cluster color legend</b></summary>
+<br>
+
+| Cluster | Color | Tissue / cell type | Marker genes |
+|---|---|---|---|
+| 0 | blue | Epithelium | CDH1, CEACAM5, EPCAM, KRT8, KRT20 |
+| 1 | red | Epithelium (2nd subpopulation) | KRT19 |
+| 2 | green | Smooth muscle (muscularis) | ACTA2, MYH11 |
+| 3 | purple | Endothelium + fibroblast | CLDN5, PECAM1, VWF, DCN |
+| 4 | yellow | Fibroblast | COL1A1, COL1A2, COL3A1 |
+| 6 | pink | B cells | CD79A |
+| 9 | olive | Myeloid | CD14, CD68 |
+| 10 | lavender | B cells + T cells | MS4A1, CD2 |
+
+Clusters 5, 7, 8, 11-17 had no significant hit among the 26 canonical genes
+tested and aren't labeled here.
+</details>
+
+<details>
+<summary><b>Normal-adjacent (P5_NormalAdjacent) cluster color legend</b></summary>
+<br>
+
+| Cluster | Color | Tissue / cell type | Marker genes |
+|---|---|---|---|
+| 0 | blue | Epithelium | CDH1, EPCAM, KRT8 |
+| 1 | red | Epithelium (2nd subpopulation) | CEACAM5, KRT19, KRT20 |
+| 2 | green | Smooth muscle (muscularis) | ACTA2, MYH11 |
+| 3 | purple | B cells + endothelium + fibroblast | CD79A, CLDN5, COL3A1 |
+| 4 | yellow | B cells + T cells + myeloid | MS4A1, CD2, CD3D, CD3E, LYZ |
+| 5 | cyan | Endothelium | PECAM1, VWF |
+| 6 | pink | Fibroblast | COL1A1, COL1A2, DCN |
+| 7 | steel blue | Myeloid | CD14, CD68 |
+
+Clusters 8-17 had no significant hit among the 26 canonical genes tested
+and aren't labeled here.
+</details>
 
 **Deconvolution tracks the actual tissue, not just the expression
 matrix.** Overlaying RCTD's per-bin epithelial weight on the source H&E
@@ -26,8 +105,8 @@ regularly spaced normal crypts:
 composition breakdown (top 7 cell types + other) shows epithelium and
 stroma occupying distinct, spatially coherent regions rather than a
 speckled or random mix, with the sparser immune populations (Plasma,
-Myeloid, TNKILC, B, Mast) concentrated in pockets rather than smeared
-uniformly across the tissue:
+Myeloid, TNKILC*, B, Mast) concentrated in pockets rather than smeared
+uniformly across the tissue (* T cells, NK (Natural Killer) cells, and ILCs (Innate Lymphoid Cells)):
 
 ![Per-bin cell-type composition, scatterpie](docs/img/celltype_scatterpie.png)
 
