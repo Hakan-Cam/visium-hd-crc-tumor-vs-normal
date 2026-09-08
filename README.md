@@ -122,16 +122,30 @@ uniformly across the tissue (* T cells, NK (Natural Killer) cells, and ILCs (Inn
 
 **GSEA on the tumor-vs-normal DE genes recovers textbook CRC biology.**
 Ranking all 1,123 DE-tested genes from the epithelial ROI by effect size
-and running `fgseaMultilevel` against MSigDB Hallmark + GO:BP (106 of 768
-tested pathways significant at padj <= 0.2) surfaces several independent,
-well-established cancer hallmarks that nothing in the pipeline was told to
-expect: MYC target genes up in tumor (Wnt/APC-driven MYC activation is one
-of the best-characterized drivers in CRC), oxidative phosphorylation and
-electron-transport-chain gene sets down in tumor (the Warburg effect), and
-ribosome biogenesis / rRNA metabolism plus cell migration / locomotion up
-in tumor (proliferation and invasion signatures):
+and running `fgseaMultilevel` against MSigDB Hallmark + GO:BP + C6
+(oncogenic signatures) -- 111 of 821 tested pathways significant at padj
+<= 0.2 -- surfaces several independent, well-established cancer hallmarks
+that nothing in the pipeline was told to expect: MYC target genes
+(Hallmark, padj = 0.02) and an AKT-activation signature (C6 `AKT_UP.V1_UP`,
+padj = 0.03) up in tumor -- Wnt/APC-driven MYC activation and PI3K/AKT
+signaling are two of the best-characterized drivers in CRC ([He et al.
+1998](https://pubmed.ncbi.nlm.nih.gov/9727977/); [Fearon
+2011](https://www.annualreviews.org/content/journals/10.1146/annurev-pathol-011110-130235))
+-- oxidative phosphorylation and electron-transport-chain gene sets down
+in tumor (the Warburg effect), and ribosome biogenesis / rRNA metabolism
+plus cell migration / locomotion up in tumor (proliferation and invasion
+signatures):
 
 ![GSEA dotplot, tumor vs. normal-adjacent epithelium](docs/img/gsea_dotplot.png)
+
+C6's more specific oncogene-perturbation signatures -- individual KRAS,
+EGFR, RAF and MEK sets, `MYC_UP.V1_UP` -- mostly couldn't be evaluated
+here: most have fewer than 15 of their member genes among the 1,123
+DE-tested genes, which is `fgseaMultilevel`'s minimum gene-set size to run
+at all. That's a limitation of ranking on only the DE-tested subset rather
+than the full transcriptome, not a null result -- they were untestable,
+not untested-and-negative. Of the few with enough overlap to test
+(`RAF_UP`, `EGFR_UP`, `MEK_UP`, `KRAS.DF`), none reached significance.
 
 That convergence with known biology -- from a pipeline that never sees a
 "cancer" label until the deconvolution reference is loaded -- is the

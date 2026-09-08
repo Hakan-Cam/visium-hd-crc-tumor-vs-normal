@@ -916,7 +916,13 @@ write.csv(roi_degs, file.path(out_fig, "de_gsea/roi_degs_tumor_vs_normal.csv"), 
 ```
 
 ```{r de-spatial-plot}
-top_deg_gene <- roi_degs %>% filter(p_val_adj <= 0.05) %>% slice_min(order_by = p_val_adj, n = 1) %>% pull(gene)
+top_deg_gene <- roi_degs %>% filter(p_val_adj <= 0.05) %>% slice_min(order_by = p_val_adj, n = 1, with_ties = FALSE) %>% pull(gene)
+# with_ties = FALSE guarantees a single gene even if several genes tie for
+# the smallest p_val_adj -- plausible here given ~295K epithelial bins going
+# into one Wilcoxon test, which can push many genes' adjusted p-values down
+# to the same floored/rounded value. Without it, a tie would make
+# top_deg_gene a length>1 vector, and the ggsave() call two lines down only
+# accepts a single filename -- it would error on the vectorized paste0().
 if (length(top_deg_gene) > 0) {
   cat("Top DE gene (tumor vs. normal-adjacent, epithelial ROI):", top_deg_gene, "\n")
   SpatialFeaturePlot(roi, features = top_deg_gene, pt.size.factor = 3)
@@ -932,7 +938,14 @@ go_bp <- msigdbr(species = "Homo sapiens", category = "C5", subcategory = "GO:BP
   split(x = .$gene_symbol, f = .$gs_name)
 hallmark <- msigdbr(species = "Homo sapiens", category = "H") %>%
   split(x = .$gene_symbol, f = .$gs_name)
-genesets <- c(go_bp, hallmark)
+# C6: oncogenic signature gene sets -- transcriptional signatures of named
+# oncogene/tumor-suppressor perturbations (mostly overexpression or
+# knockdown in cell lines), rather than curated pathway definitions like
+# GO:BP/Hallmark. Included here because several of its signatures (KRAS,
+# EGFR, RAF, MEK, AKT, PTEN, MYC) map directly onto CRC driver biology.
+oncogenic <- msigdbr(species = "Homo sapiens", category = "C6") %>%
+  split(x = .$gene_symbol, f = .$gs_name)
+genesets <- c(go_bp, hallmark, oncogenic)
 cat("Total gene sets loaded:", length(genesets), "\n")
 ```
 
