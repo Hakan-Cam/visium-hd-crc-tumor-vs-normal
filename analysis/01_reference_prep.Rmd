@@ -1,0 +1,169 @@
+---
+title: "01 - Building the RCTD Reference from the Pelka et al. CRC Atlas"
+output: github_document
+---
+
+## What this notebook does, and why it's separate
+
+Cell-type deconvolution (Section 8 of the main analysis) needs an
+**annotated single-cell reference**: real cells of known type, so RCTD
+can learn what each cell type's expression profile looks like and then
+ask "what mixture of these profiles best explains each spatial bin?"
+
+That reference is a substantial dataset in its own right (371,223 cells),
+built once and reused, so it gets its own notebook rather than being
+buried inside the main pipeline -- exactly the same reason the original
+workshop material this project is modeled on treated reference-building
+as a separate pre-step rather than inline code.
+
+We use [Pelka et al. 2021, *Cell*](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE178341) --
+human colorectal tumor **and** normal-adjacent cells, annotated by cell
+type, from the same tissue type as our Visium HD samples. Matching
+reference tissue to spatial tissue matters: deconvolving human colon
+spots against, say, a brain atlas would force RCTD to explain every spot
+with cell types that were never actually there.
+
+```{r setup, message=FALSE, warning=FALSE}
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(spacexr)
+  library(tidyverse)
+  library(data.table)
+  library(hdf5r)
+})
+
+set.seed(123)
+
+ref_dir <- "../data/scref"
+out_dir <- "../output/rdata"
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+h5_path       <- file.path(ref_dir, "crc10x_full_c295v4_submit.h5")
+cluster_path  <- file.path(ref_dir, "crc10x_full_c295v4_submit_cluster.csv.gz")
+metatable_path <- file.path(ref_dir, "crc10x_full_c295v4_submit_metatables.csv.gz")
+
+stopifnot(
+  "Run download_data.sh first -- reference files not found" =
+    file.exists(h5_path, cluster_path, metatable_path)
+)
+```
+
+## Step 1: Load the expression matrix
+
+GEO deposits vary in internal H5 structure -- some are plain CellRanger-
+style matrices (`Read10X_h5` handles these directly), others are
+AnnData/`SummarizedExperiment`-style objects with different internal
+group names. We try the standard loader first and fall back to
+inspecting the file's structure by hand if it doesn't fit, rather than
+assuming and failing silently.
+
+```{r load-h5}
+counts_ref <- tryCatch(
+  Read10X_h5(h5_path),
+  error = function(e) {
+    message("Read10X_h5() didn't work directly (", conditionMessage(e), ").\n",
+            "Inspecting the file's internal structure instead:")
+    f <- H5File$new(h5_path, mode = "r")
+    print(f$ls(recursive = TRUE))
+    f$close_all()
+    stop(
+      "See the group listing above, adapt the loading code to match it ",
+      "(common alternative: matrix/genes/barcodes stored under different ",
+      "group names -- build the dgCMatrix by hand from those groups), ",
+      "then re-run this chunk."
+    )
+  }
+)
+
+cat("Reference matrix:", nrow(counts_ref), "genes x", ncol(counts_ref), "cells\n")
+```
+
+## Step 2: Load and inspect the cell-type metadata
+
+We don't hard-code a column name here -- we print what's actually in the
+file and pick the cell-type column deliberately, which is the right
+habit for any dataset you didn't generate yourself.
+
+```{r load-metadata}
+cluster_tbl  <- fread(cluster_path)
+metatable    <- fread(metatable_path)
+
+cat("cluster file columns:", paste(colnames(cluster_tbl), collapse = ", "), "\n")
+cat("metatable columns:   ", paste(colnames(metatable), collapse = ", "), "\n")
+
+head(cluster_tbl)
+head(metatable)
+```
+
+```{r pick-celltype-column}
+# Real-world GEO quirk, confirmed against this release: the two files
+# split information differently than their names suggest. `metatable`
+# carries per-cell *clinical* fields (tumor stage, MMR status, tissue
+# site, patient ID...) but no cell-type label at all -- the cell-type
+# calls (clTopLevel = broad lineage, cl295v11SubFull = fine subtype)
+# are in `cluster_tbl` instead. And cluster_tbl's first column, whatever
+# fread happens to name it, actually holds the cell barcode (values look
+# like "C103_T_1_1_0_c1_v2_id-AAACCTGCATGCTAGT", matching
+# metatable$cellID) -- not what its header implies. So: read that first
+# column by position, not by trusting its name, and take cell type from
+# cluster_tbl rather than metatable.
+cluster_barcode <- cluster_tbl[[1]]
+
+celltype_candidates <- c("clTopLevel", "cl295v11SubFull", "cl295v11SubShort", "clMidwayPr", "cellType", "cell_type", "CellType")
+celltype_col <- intersect(celltype_candidates, colnames(cluster_tbl))[1]
+
+stopifnot(
+  "None of the expected cell-type column names were found in cluster_tbl -- open \
+   the cluster file printout above and set `celltype_col` to the right column \
+   name by hand." = !is.na(celltype_col)
+)
+cat("Using '", celltype_col, "' (from the cluster file) as the cell-type label.\n", sep = "")
+
+meta <- tibble(cell_id = cluster_barcode, cell_type = cluster_tbl[[celltype_col]]) %>%
+  filter(cell_id %in% colnames(counts_ref)) %>%
+  distinct(cell_id, .keep_all = TRUE)
+
+cat("Matched", nrow(meta), "of", ncol(counts_ref), "reference cells to a cell-type label.\n")
+cat(sum(meta$cell_id %in% metatable$cellID), "of those also have matching clinical metadata in metatable.\n")
+```
+
+## Step 3: Filter rare cell types
+
+RCTD needs a reasonable number of example cells per type to learn a
+stable expression profile -- the same `>= 10 cells` bar used for every
+reference in the main analysis.
+
+```{r filter-rare-types}
+counts_ref <- counts_ref[, meta$cell_id]
+cell_types_full <- setNames(factor(meta$cell_type), meta$cell_id)
+
+ct_counts  <- table(cell_types_full)
+keep_types <- names(ct_counts[ct_counts >= 10])
+cat("Dropping", sum(ct_counts < 10), "cell types with <10 cells (of",
+    length(ct_counts), "total types)\n")
+
+keep_cells   <- names(cell_types_full)[cell_types_full %in% keep_types]
+counts_ref   <- counts_ref[, keep_cells]
+cell_types   <- droplevels(cell_types_full[keep_cells])
+
+cat("Final reference:", ncol(counts_ref), "cells across", nlevels(cell_types), "cell types\n")
+print(sort(table(cell_types), decreasing = TRUE))
+```
+
+## Step 4: Build the RCTD `Reference` object
+
+```{r build-reference}
+nUMI_ref <- colSums(counts_ref)
+rctd_ref <- Reference(counts_ref, cell_types, nUMI_ref)
+```
+
+## Step 5: Save for reuse
+
+```{r save}
+if (requireNamespace("qs2", quietly = TRUE)) {
+  qs2::qs_save(rctd_ref, file.path(out_dir, "crc_rctd_reference.qs2"))
+} else {
+  saveRDS(rctd_ref, file.path(out_dir, "crc_rctd_reference.rds"))
+}
+cat("Saved. This is the object 02_visium_hd_analysis.Rmd loads for RCTD.\n")
+```

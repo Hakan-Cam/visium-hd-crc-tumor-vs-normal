@@ -1,0 +1,1003 @@
+---
+title: "Visium HD: Tumor vs. Normal-Adjacent Colorectal Cancer"
+output: github_document
+---
+
+## Overview
+
+This notebook analyzes two 10x Genomics **Visium HD** samples from the
+same patient (P5, from [Oliveira et al. 2025, *Nature Genetics*](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE280315)):
+colorectal tumor tissue and normal-adjacent colon tissue, at 8µm bin
+resolution. It walks through loading, QC, clustering, marker genes,
+merging the two samples, cell-type deconvolution against a matched
+single-cell reference, and a differential expression + gene set
+enrichment comparison between the tumor and the normal-adjacent tissue.
+
+Run `analysis/01_reference_prep.Rmd` first -- it builds the deconvolution
+reference this notebook loads in Section 8.
+
+**Why Visium HD needs a different approach than standard Visium.**
+Standard Visium has ~2,000-5,000 fixed-diameter (55µm) spots per section,
+small enough to cluster directly. Visium HD instead bins continuous
+2µm measurements into a grid -- at 8µm resolution, that's on the order of
+100,000-400,000 bins *per sample*. Clustering that many bins directly
+(PCA, neighbor graphs, UMAP) is slow and memory-heavy. Seurat v5's
+solution, used throughout this notebook, is the ["sketch" workflow](https://satijalab.org/seurat/articles/seurat5_sketch_analysis):
+subsample a representative ~50,000 bins, do the expensive steps
+(dimensionality reduction, clustering, UMAP) on that sketch, then
+project the results back onto every bin.
+
+## Section 1: Environment
+
+```{r setup, message=FALSE, warning=FALSE}
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(spacexr)
+  library(SPOTlight)
+  library(scatterpie)
+  library(ggplot2)
+  library(tidyverse)
+  library(patchwork)
+  library(hdf5r)
+  library(qs2)
+  library(fgsea)
+  library(msigdbr)
+  library(data.table)
+  library(pheatmap)
+})
+
+# A single seed at the top is enough here -- we call it once, before any
+# randomized step (SketchData's subsampling, RunUMAP's initialization),
+# and don't re-seed mid-pipeline. Note that exact numerical reproducibility
+# of clustering/UMAP across different machines or package versions isn't
+# guaranteed even with a fixed seed (BLAS/OpenMP thread scheduling can
+# still introduce tiny floating-point differences) -- treat "same seed" as
+# "same result on this machine, this session," not an absolute guarantee.
+set.seed(123)
+
+data_dir   <- "../data/visium_hd"
+ref_dir    <- "../output/rdata"
+out_fig    <- "../output/figures"
+out_rdata  <- "../output/rdata"
+
+for (d in c(
+  file.path(out_fig, "section2_load"),
+  file.path(out_fig, "section3_qc"),
+  file.path(out_fig, "section5_clusters"),
+  file.path(out_fig, "section6_markers"),
+  file.path(out_fig, "section7_merge"),
+  file.path(out_fig, "deconvolution"),
+  file.path(out_fig, "roi"),
+  file.path(out_fig, "de_gsea"),
+  out_rdata
+)) dir.create(d, recursive = TRUE, showWarnings = FALSE)
+
+colorset <- c(
+  "#0166d8", "#ec102f", "#3aa609", "#6524ff", "#f8d147", "#5ce8ef", "#fd6ca0",
+  "#476ba5", "#fea27a", "#add465", "#b775e1", "#fe8f06", "#5cfdc4", "#feafda",
+  "#00228b", "#fd5925", "#166d2a", "#a90aa1", "#f3c011", "#5ac7dc", "#c1c2f5",
+  "#1f29a1", "#e13224", "#86ec5a", "#672396", "#e1c637", "#069668", "#fcb2c7",
+  "#1288da", "#c26a6b", "#6e9d50", "#1e0e76", "#fea53b", "#15729c", "#ffa8ff",
+  "#270fe2", "#8a1341", "#285d28", "#956bed", "#f79302", "#116966", "#d945c2",
+  "#94a6fd", "#e13219", "#01c472", "#afc6fe", "#e3c60b", "#aedfca", "#c2639f",
+  "#0e2450", "#6d1a44", "#91fc40", "#5858e1", "#fca283", "#1eefc9", "#fb2076",
+  "#8bd0eb"
+)
+
+BIN_SIZE <- 8  # microns -- the one resolution this notebook uses throughout
+```
+
+## Section 2: Load the P5 Tumor sample (8µm bins)
+
+Visium HD's Space Ranger output nests each bin resolution under
+`binned_outputs/square_0{size}um/`, unlike standard Visium's flat `outs/`
+layout -- `Load10X_Spatial(..., bin.size = 8)` expects exactly that
+nesting under `data.dir`, which is how `download_data.sh` laid the files
+out.
+
+```{r load-tumor}
+tumor <- Load10X_Spatial(
+  data.dir = file.path(data_dir, "P5_Tumor"),
+  bin.size = BIN_SIZE,
+  slice    = "P5_Tumor"
+)
+tumor
+```
+
+```{r inspect-tumor}
+str(tumor@images, max.level = 2)
+
+# Sanity check on bin count: GEO depositors typically upload one
+# representative Space Ranger resolution rather than all three. 8um bins
+# over a standard 6.5x6.5mm Visium HD capture area should land somewhere
+# in the ~100,000-400,000 range -- well above 16um's ~25,000-100,000 and
+# far below 2um's several million. If what you loaded is wildly outside
+# that range, you likely have a different bin size than you think.
+cat("Bin count loaded:", ncol(tumor), "\n")
+```
+
+```{r tumor-alignment-check}
+SpatialFeaturePlot(tumor, features = "nCount_Spatial.008um", image.alpha = 1) +
+  ggtitle("P5 Tumor -- nCount per 8um bin")
+ggsave(file.path(out_fig, "section2_load/tumor_alignment_check.png"),
+       width = 7, height = 7, dpi = 300, bg = "white")
+```
+
+*Note on the assay name:* `Load10X_Spatial(bin.size = 8)` creates an
+assay named `Spatial.008um` (the bin size is baked into the assay name so
+multiple resolutions can coexist in one object if you load more than
+one). Every `Spatial`-assay reference later in this notebook uses that
+full name -- watch for it if you copy code from a standard-Visium
+tutorial, which will just say `Spatial`.
+
+## Section 3: QC
+
+```{r qc-tumor}
+# Human mitochondrial genes are named MT- (e.g. MT-ND1, MT-CO1, MT-CYB) --
+# uppercase, with a hyphen. This is different from mouse's lowercase
+# "mt-" convention (e.g. mt-Nd1) -- gene-naming conventions are
+# species-specific and don't transfer between a mouse pipeline and human
+# data without checking.
+DefaultAssay(tumor) <- "Spatial.008um"
+tumor[["percent.mt"]] <- PercentageFeatureSet(tumor, pattern = "^MT-")
+tumor$condition <- "tumor"
+tumor$patient   <- "P5"
+head(tumor@meta.data)
+```
+
+```{r qc-tumor-plots}
+VlnPlot(tumor, features = c("nCount_Spatial.008um", "nFeature_Spatial.008um", "percent.mt"),
+        pt.size = 0)
+ggsave(file.path(out_fig, "section3_qc/tumor_qc_violin.png"), width = 9, height = 5, dpi = 300, bg = "white")
+
+SpatialFeaturePlot(tumor, features = c("nCount_Spatial.008um", "nFeature_Spatial.008um", "percent.mt"))
+ggsave(file.path(out_fig, "section3_qc/tumor_qc_spatial.png"), width = 12, height = 5, dpi = 300, bg = "white")
+```
+
+```{r qc-tumor-filter}
+# 8um bins are tiny compared to a standard 55um Visium spot, so per-bin
+# UMI counts run much lower -- don't reuse standard-Visium count
+# thresholds here. QC thresholds for Visium HD bins are still an
+# actively-discussed area of the field (much like normalization choices --
+# see Seurat's own Visium HD vignette, which flags the same thing); the
+# values below are a deliberately modest starting filter, not a
+# definitive answer. Inspect the violin plot above before trusting them,
+# and tighten or loosen based on what you see.
+n_before <- ncol(tumor)
+tumor <- subset(tumor, subset = nCount_Spatial.008um >= 1 & percent.mt < 30)
+cat("Tumor: kept", ncol(tumor), "of", n_before, "bins after QC filtering\n")
+```
+
+## Section 4-5: Sketch-based normalization, clustering, and visualization
+
+```{r sketch-tumor}
+DefaultAssay(tumor) <- "Spatial.008um"
+
+# SketchData has to run on the RAW-counts assay, named explicitly via
+# `assay =` -- leaving it at its default picks up whatever DefaultAssay()
+# currently is, and sketching *after* SCTransform breaks: LeverageScore's
+# internal cell lookup on an SCT assay expects a "counts" model and gets
+# "data" instead. So we sketch first, from plain counts, and only
+# normalize the ~50,000-bin sketch afterward -- which is also the
+# cheaper order of operations, since SCTransform now runs on 50K bins
+# instead of the full 100K-400K.
+#
+# SketchData subsamples using a "LeverageScore" scheme that deliberately
+# over-represents rare/unusual expression profiles rather than sampling
+# uniformly at random -- the goal is a subsample that still contains rare
+# cell populations, not just the most common ones. Computing that score
+# needs normalized data and a variable-feature set to work from (Seurat's
+# own sketch vignette runs these two first) -- skipping them doesn't
+# error, it just leaves LeverageScore unable to score cells properly, and
+# SketchData quietly stops subsampling at all. Both steps are cheap
+# (simple per-cell math, not SCTransform) even at hundreds of thousands
+# of bins, so this doesn't reintroduce the cost sketching exists to avoid.
+tumor <- NormalizeData(tumor, assay = "Spatial.008um") %>%
+  FindVariableFeatures(assay = "Spatial.008um")
+
+n_sketch <- min(50000, ncol(tumor))
+tumor <- SketchData(tumor, assay = "Spatial.008um", ncells = n_sketch,
+                     method = "LeverageScore", sketched.assay = "sketch")
+
+DefaultAssay(tumor) <- "sketch"
+# new.assay.name = "sketch" matters: left at its default ("SCT"),
+# SCTransform would write the transformed data into a *new* assay called
+# "SCT" while leaving "sketch" as untransformed counts -- and ProjectData
+# below, told the sketch lives in "sketch", would find no SCT model
+# there. Naming the output back onto "sketch" keeps them in sync.
+tumor <- SCTransform(tumor, assay = "sketch", new.assay.name = "sketch",
+                      vars.to.regress = "percent.mt", return.only.var.genes = FALSE) %>%
+  RunPCA(npcs = 30) %>%
+  FindNeighbors(dims = 1:30, k.param = 30) %>%   # k.param, not k.parm -- see note below
+  FindClusters(resolution = 0.5) %>%
+  RunUMAP(dims = 1:30, return.model = TRUE)
+
+# Project the sketch's clusters, UMAP, and dimensionality reduction back
+# onto every one of the ~100K-400K bins we didn't cluster directly.
+# normalization.method = "SCT" tells ProjectData to apply the sketch's
+# SCT model to the full (un-sketched) assay itself as part of
+# projecting -- we don't separately SCTransform the full object.
+tumor <- ProjectData(
+  object = tumor,
+  assay = "Spatial.008um",
+  sketched.assay = "sketch",
+  full.reduction = "pca.full",
+  sketched.reduction = "pca",
+  umap.model = "umap",
+  dims = 1:30,
+  normalization.method = "SCT",
+  refdata = list(seurat_clusters = "seurat_clusters")
+)
+DefaultAssay(tumor) <- "Spatial.008um"
+
+# ProjectData's refdata transfer hands back seurat_clusters as plain
+# character, not a factor -- levels() on a character vector is NULL,
+# which is what breaks the colorset-based plots below (and would sort
+# "10" before "2" if left as strings). Restore it as a proper factor,
+# ordered numerically.
+tumor$seurat_clusters <- factor(
+  tumor$seurat_clusters,
+  levels = as.character(sort(as.numeric(unique(tumor$seurat_clusters))))
+)
+table(tumor$seurat_clusters)
+```
+
+*Expected message:* `ProjectData()` prints `"pca.full is not in the
+object. Data from all cells will be projected to pca"` the first time
+you run it -- that's it telling you it's about to create the full-scale
+PCA reduction from scratch (fine, since this is the first projection),
+not an error. `Layers()` on the assay afterward will also show more than
+one layer (e.g. `counts`, `data`) -- that's normal internal Seurat
+bookkeeping, not a sign the merge/join step above failed.
+
+*On `k.param`:* this is the correct name for the neighbor-count
+parameter in `FindNeighbors()` -- a common typo (`k.parm`, missing the
+`a`) doesn't raise an error (it silently absorbs into `FindNeighbors`'s
+`...` and gets dropped), so clustering would quietly run with the default
+`k.param = 20` instead of whatever you intended. Since it fails silently,
+it's worth double-checking the spelling explicitly rather than trusting
+that "no error" means "did what I asked."
+
+```{r tumor-umap-plot}
+colors <- setNames(colorset[seq_along(levels(tumor$seurat_clusters))], levels(tumor$seurat_clusters))
+
+DimPlot(tumor, reduction = "full.umap", group.by = "seurat_clusters", cols = colors)
+ggsave(file.path(out_fig, "section5_clusters/tumor_umap.png"), width = 7, height = 6, dpi = 300, bg = "white")
+
+SpatialDimPlot(tumor, group.by = "seurat_clusters", cols = colors, pt.size.factor = 4)
+ggsave(file.path(out_fig, "section5_clusters/tumor_spatial_clusters.png"), width = 7, height = 7, dpi = 300, bg = "white")
+```
+
+## Section 6: Marker genes
+
+```{r tumor-markers-prep}
+tumor <- NormalizeData(tumor, assay = "Spatial.008um") %>%
+  ScaleData(assay = "Spatial.008um")
+
+# The original mouse pipeline this project is modeled on dropped
+# "*Rik"-suffixed and "Gm#####"-prefixed genes -- both are mouse-specific
+# placeholder names for uncharacterized loci and don't exist in human
+# annotation. Human's equivalent placeholder pattern is a clone/contig
+# accession standing in for a gene symbol (e.g. "AC004551.1",
+# "AL359922.2") wherever no official gene symbol has been assigned yet --
+# same underlying idea (deprioritize uncharacterized loci in marker
+# lists), adapted to how human annotation actually names them.
+bad_genes <- rownames(tumor)[str_detect(rownames(tumor), "^A[CL][0-9]{5,6}\\.[0-9]+$")]
+genes_we_like <- setdiff(rownames(tumor), bad_genes)
+cat("Excluding", length(bad_genes), "clone/contig-named genes from marker search\n")
+```
+
+**A performance note on marker-gene testing.** `FindAllMarkers` runs a
+Wilcoxon rank-sum test per gene, per cluster-vs-rest comparison.
+Seurat's fallback implementation (used when the `immunogenomics/presto`
+package isn't installed) is single-threaded and its runtime scales with
+cell count -- timed directly against this notebook's ~510,000 raw bins,
+cluster 0 alone was still running after 15+ minutes, which extrapolates
+to multiple hours for all 18 clusters. We could not get `presto` to
+compile in the Windows environment this was developed on (it needs a
+working Rtools toolchain, which didn't cooperate on that machine).
+Rather than accept a multi-hour wait for one step, we test markers on
+the same ~50,000-bin leverage-score sketch already used for clustering
+above -- Seurat's own documented pattern for exactly this situation
+(see the [sketch workflow vignette](https://satijalab.org/seurat/articles/seurat5_sketch_analysis)).
+That cut this step from an estimated multi-hour run to about 5 minutes.
+
+This changes *which* genes get flagged as top markers, not the
+expression values plotted below (those are still drawn from the full,
+un-sketched data) -- and 50,000 cells is still a large sample for a
+rank-based test, so real, strong markers should come through
+unaffected. We don't just assert that: the `marker-sanity-check` chunk
+right after the marker plots below tests the result against a panel of
+textbook colorectal/immune marker genes as a concrete check. If you
+have `presto` installed and want to test every bin instead, swap
+`tumor_for_markers` below back to `tumor`.
+
+```{r tumor-find-markers}
+Idents(tumor) <- "seurat_clusters"
+DefaultAssay(tumor) <- "Spatial.008um"
+
+# Test markers on the sketch cells only -- see the note above.
+sketch_cells <- colnames(tumor[["sketch"]])
+tumor_for_markers <- subset(tumor, cells = sketch_cells)
+DefaultAssay(tumor_for_markers) <- "Spatial.008um"
+Idents(tumor_for_markers) <- "seurat_clusters"
+
+tumor_markers <- FindAllMarkers(
+  tumor_for_markers, assay = "Spatial.008um", only.pos = TRUE, features = genes_we_like,
+  min.pct = 0.1, logfc.threshold = 0.2
+)
+```
+
+```{r tumor-marker-plots}
+top3_genes <- tumor_markers %>%
+  filter(p_val_adj <= 0.05) %>%
+  group_by(cluster) %>%
+  slice_min(order_by = p_val_adj, n = 50) %>%
+  slice_max(order_by = avg_log2FC, n = 3) %>%
+  pull(gene) %>% unique()
+
+DotPlot(tumor, features = top3_genes) &
+  scale_color_continuous(type = "viridis") &
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 1))
+ggsave(file.path(out_fig, "section6_markers/tumor_top3_dotplot.png"), width = 10, height = 6, dpi = 300, bg = "white")
+
+top1_gene <- tumor_markers %>%
+  filter(p_val_adj <= 0.05) %>%
+  group_by(cluster) %>%
+  slice_min(order_by = p_val_adj, n = 50) %>%
+  slice_max(order_by = avg_log2FC, n = 1) %>%
+  pull(gene) %>% unique()
+
+SpatialFeaturePlot(tumor, features = top1_gene, pt.size.factor = 3,
+                    alpha = c(0.1, 1), ncol = 4) &
+  theme(legend.position = "right", plot.title = element_text(size = 8))
+ggsave(file.path(out_fig, "section6_markers/tumor_top1_markers_spatial.png"),
+       width = 16, height = 12, dpi = 300, bg = "white")
+```
+
+## Sanity-checking the sketch-based markers
+
+Because the step above tests markers on a ~50,000-bin subsample rather
+than all ~510,000 bins (see the note above), it's worth confirming the
+result reflects real biology before trusting it, rather than taking the
+shortcut on faith. We check it against a small panel of textbook
+colorectal/immune cell-type markers: if the sketch-based test is
+working, most of these should turn up as significant markers, *and*
+markers for the same cell type should land on the same cluster IDs
+rather than being scattered randomly across unrelated clusters.
+
+```{r marker-sanity-check}
+canonical_markers <- list(
+  epithelial    = c("EPCAM", "KRT8", "KRT18", "KRT19", "KRT20", "CEACAM5", "CDH1"),
+  t_cell        = c("CD3D", "CD3E", "CD2", "PTPRC"),
+  b_cell        = c("CD79A", "MS4A1", "CD19"),
+  myeloid       = c("CD68", "LYZ", "CD14"),
+  fibroblast    = c("COL1A1", "COL1A2", "COL3A1", "DCN"),
+  endothelial   = c("PECAM1", "VWF", "CLDN5"),
+  smooth_muscle = c("ACTA2", "MYH11")
+)
+all_canonical <- unlist(canonical_markers, use.names = FALSE)
+
+hits <- tumor_markers %>%
+  filter(gene %in% all_canonical) %>%
+  arrange(gene, p_val_adj) %>%
+  select(gene, cluster, avg_log2FC, pct.1, pct.2, p_val_adj)
+
+cat("Canonical marker genes eligible for testing:", sum(all_canonical %in% genes_we_like),
+    "of", length(all_canonical), "\n")
+cat("Canonical marker genes recovered as a significant cluster marker:",
+    length(unique(hits$gene)), "of", length(all_canonical), "\n\n")
+print(as.data.frame(hits))
+```
+
+If most canonical genes are missing here, or the ones that do show up
+land on inconsistent/scattered clusters, that's a signal to fall back
+to full-data marker testing (accepting the runtime cost) rather than
+trust the sketch-based shortcut.
+
+## Applying the same steps to P5 Normal-Adjacent
+
+Sections 2-6 above were written out in full, step by step, for the tumor
+sample. Copy-pasting that same block a second time with `tumor` swapped
+for a new variable name would work, but it's the kind of duplication
+that turns into a maintenance problem the moment you want to change a
+parameter (you'd have to remember to change it in two places, or six, as
+more samples show up) -- so instead we fold the identical logic into one
+function and call it again. Same analysis, written once.
+
+```{r process-function}
+process_visium_hd_sample <- function(sample_dir, slice_name, condition,
+                                      patient = "P5", bin_size = BIN_SIZE,
+                                      mt_pattern = "^MT-",
+                                      resolution = 0.5, n_sketch_max = 50000) {
+  obj <- Load10X_Spatial(data.dir = sample_dir, bin.size = bin_size, slice = slice_name)
+  assay_name <- paste0("Spatial.", formatC(bin_size, width = 3, flag = "0"), "um")
+  DefaultAssay(obj) <- assay_name
+
+  obj[["percent.mt"]] <- PercentageFeatureSet(obj, pattern = mt_pattern)
+  obj$condition <- condition
+  obj$patient   <- patient
+  obj <- subset(obj, subset = nCount_Spatial.008um >= 1 & percent.mt < 30)
+
+  # See the annotated version of this same sequence in Section 4-5 above
+  # for why the order is sketch-then-SCTransform (not the reverse), and
+  # why new.assay.name / normalization.method are set the way they are.
+  # LeverageScore also needs normalized data + variable features to score
+  # cells from (see the note in Section 4-5) -- cheap steps, done here too.
+  obj <- NormalizeData(obj, assay = assay_name) %>% FindVariableFeatures(assay = assay_name)
+  obj <- SketchData(obj, assay = assay_name, ncells = min(n_sketch_max, ncol(obj)),
+                     method = "LeverageScore", sketched.assay = "sketch")
+  DefaultAssay(obj) <- "sketch"
+  obj <- SCTransform(obj, assay = "sketch", new.assay.name = "sketch",
+                      vars.to.regress = "percent.mt", return.only.var.genes = FALSE) %>%
+    RunPCA(npcs = 30) %>%
+    FindNeighbors(dims = 1:30, k.param = 30) %>%
+    FindClusters(resolution = resolution) %>%
+    RunUMAP(dims = 1:30, return.model = TRUE)
+
+  obj <- ProjectData(
+    object = obj, assay = assay_name, sketched.assay = "sketch",
+    full.reduction = "pca.full", sketched.reduction = "pca", umap.model = "umap",
+    dims = 1:30, normalization.method = "SCT",
+    refdata = list(seurat_clusters = "seurat_clusters")
+  )
+  DefaultAssay(obj) <- assay_name
+  # Same ProjectData quirk as Section 4-5: refdata comes back as character,
+  # not a factor -- restore it before anything downstream calls levels().
+  obj$seurat_clusters <- factor(
+    obj$seurat_clusters,
+    levels = as.character(sort(as.numeric(unique(obj$seurat_clusters))))
+  )
+  obj <- NormalizeData(obj, assay = assay_name) %>% ScaleData(assay = assay_name)
+  obj
+}
+```
+
+```{r process-normal-adjacent}
+normal <- process_visium_hd_sample(
+  sample_dir = file.path(data_dir, "P5_NormalAdjacent"),
+  slice_name = "P5_NormalAdjacent",
+  condition  = "normal_adjacent"
+)
+table(normal$seurat_clusters)
+```
+
+```{r normal-adjacent-plots}
+n_colors <- setNames(colorset[seq_along(levels(normal$seurat_clusters))], levels(normal$seurat_clusters))
+
+DimPlot(normal, reduction = "full.umap", group.by = "seurat_clusters", cols = n_colors)
+ggsave(file.path(out_fig, "section5_clusters/normal_umap.png"), width = 7, height = 6, dpi = 300, bg = "white")
+
+SpatialDimPlot(normal, group.by = "seurat_clusters", cols = n_colors, pt.size.factor = 4)
+ggsave(file.path(out_fig, "section5_clusters/normal_spatial_clusters.png"), width = 7, height = 7, dpi = 300, bg = "white")
+```
+
+```{r normal-adjacent-markers}
+bad_genes_normal <- rownames(normal)[str_detect(rownames(normal), "^A[CL][0-9]{5,6}\\.[0-9]+$")]
+genes_we_like_normal <- setdiff(rownames(normal), bad_genes_normal)
+
+Idents(normal) <- "seurat_clusters"
+DefaultAssay(normal) <- "Spatial.008um"
+
+# Same sketch-based shortcut as the tumor sample above (see the
+# performance note in Section 6) -- testing markers on the ~50,000-bin
+# sketch instead of every bin, since presto isn't available here.
+sketch_cells_normal <- colnames(normal[["sketch"]])
+normal_for_markers <- subset(normal, cells = sketch_cells_normal)
+DefaultAssay(normal_for_markers) <- "Spatial.008um"
+Idents(normal_for_markers) <- "seurat_clusters"
+
+normal_markers <- FindAllMarkers(
+  normal_for_markers, assay = "Spatial.008um", only.pos = TRUE, features = genes_we_like_normal,
+  min.pct = 0.1, logfc.threshold = 0.2
+)
+
+top3_genes_normal <- normal_markers %>%
+  filter(p_val_adj <= 0.05) %>%
+  group_by(cluster) %>%
+  slice_min(order_by = p_val_adj, n = 50) %>%
+  slice_max(order_by = avg_log2FC, n = 3) %>%
+  pull(gene) %>% unique()
+
+DotPlot(normal, features = top3_genes_normal) &
+  scale_color_continuous(type = "viridis") &
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 1))
+ggsave(file.path(out_fig, "section6_markers/normal_top3_dotplot.png"), width = 10, height = 6, dpi = 300, bg = "white")
+```
+
+```{r marker-sanity-check-normal}
+# Same check as the tumor sample's marker-sanity-check chunk above,
+# run here on the normal-adjacent sample's sketch-based markers.
+hits_normal <- normal_markers %>%
+  filter(gene %in% all_canonical) %>%
+  arrange(gene, p_val_adj) %>%
+  select(gene, cluster, avg_log2FC, pct.1, pct.2, p_val_adj)
+
+cat("Canonical marker genes eligible for testing:", sum(all_canonical %in% genes_we_like_normal),
+    "of", length(all_canonical), "\n")
+cat("Canonical marker genes recovered as a significant cluster marker:",
+    length(unique(hits_normal$gene)), "of", length(all_canonical), "\n\n")
+print(as.data.frame(hits_normal))
+```
+
+## Section 7: Merging the two samples
+
+```{r merge}
+dir.create(file.path(out_fig, "section7_merge"), recursive = TRUE, showWarnings = FALSE)
+
+# Merge the two ALREADY-PROCESSED sample objects -- each carries its own
+# per-sample SCT/sketch assays from Sections 4-6, which we don't need
+# anymore now that we're about to fit one joint model, but `merge()`
+# keeps everything by default and that's harmless.
+obj_list <- list("P5_Tumor" = tumor, "P5_NormalAdjacent" = normal)
+spatial <- merge(x = obj_list[[1]], y = obj_list[2:length(obj_list)], add.cell.ids = names(obj_list))
+DefaultAssay(spatial) <- "Spatial.008um"
+
+# merge() keeps each original object's counts in its own layer
+# ("counts.1", "counts.2", ...) rather than combining them immediately --
+# a deliberate Seurat v5 design (cheap merges; join only when you need
+# to). Left unjoined, SCTransform below would fit a SEPARATE model per
+# original sample instead of one pooled model across both conditions,
+# and ProjectData would then refuse to project against multiple
+# reference SCT models -- join first.
+spatial <- JoinLayers(spatial, assay = "Spatial.008um")
+```
+
+**Extending sketch-clustering to two merged samples.** Seurat's official
+sketch-clustering vignette only demonstrates a single sample -- as of
+this writing there's no built-in multi-sample Visium HD workflow (see
+[satijalab/seurat#9318](https://github.com/satijalab/seurat/issues/9318)
+and [#9652](https://github.com/satijalab/seurat/issues/9652), both open
+questions on exactly this). The approach below is a direct, defensible
+extension of the documented single-sample pattern rather than a
+guaranteed-official one: join the two samples' raw counts into one
+assay, sketch and fit a single fresh SCT model *jointly* across both
+conditions (rather than reusing either sample's own independently-fit
+SCT model from Sections 4-6, which wouldn't be on a comparable scale),
+then cluster and project exactly as before. Because `SketchData`'s
+`LeverageScore` method subsamples based on each bin's own expression
+profile, a joint sketch over the merged object should represent both
+samples' rare populations, not just whichever sample happens to
+dominate by bin count -- but this hasn't been validated against an
+official reference implementation, so treat the joint clustering that
+comes out of it a little more provisionally than the per-sample
+clustering above, and sanity-check it (e.g. via the condition-split UMAP
+below) before leaning on it hard.
+
+```{r merge-sketch-cluster}
+# Same LeverageScore prerequisite as the per-sample sketching above --
+# normalize + pick variable features on the joined object first.
+spatial <- NormalizeData(spatial, assay = "Spatial.008um") %>%
+  FindVariableFeatures(assay = "Spatial.008um")
+
+n_sketch_joint <- min(50000, ncol(spatial))
+spatial <- SketchData(spatial, assay = "Spatial.008um", ncells = n_sketch_joint,
+                       method = "LeverageScore", sketched.assay = "sketch")
+
+DefaultAssay(spatial) <- "sketch"
+spatial <- SCTransform(spatial, assay = "sketch", new.assay.name = "sketch",
+                        vars.to.regress = "percent.mt", return.only.var.genes = FALSE) %>%
+  RunPCA(npcs = 30) %>%
+  FindNeighbors(dims = 1:30, k.param = 30) %>%
+  FindClusters(resolution = 0.6) %>%
+  RunUMAP(dims = 1:30, return.model = TRUE)
+
+spatial <- ProjectData(
+  object = spatial, assay = "Spatial.008um", sketched.assay = "sketch",
+  full.reduction = "pca.full", sketched.reduction = "pca", umap.model = "umap",
+  dims = 1:30, normalization.method = "SCT",
+  refdata = list(seurat_clusters = "seurat_clusters")
+)
+DefaultAssay(spatial) <- "Spatial.008um"
+
+# Same ProjectData quirk as Section 4-5 -- restore the factor before
+# levels() gets called on it for coloring.
+spatial$seurat_clusters <- factor(
+  spatial$seurat_clusters,
+  levels = as.character(sort(as.numeric(unique(spatial$seurat_clusters))))
+)
+table(spatial$seurat_clusters)
+table(spatial$condition, spatial$seurat_clusters)
+```
+
+```{r merge-renormalize}
+# Spatial.008um is already joined (done above, before sketching) -- just
+# renormalize it for the DE step in Section 13.
+spatial <- NormalizeData(spatial, assay = "Spatial.008um")
+
+# A dense scale.data matrix across every gene (~18,000) x every merged
+# bin (~917,000, tumor + normal-adjacent combined) needs on the order of
+# 130GB for that matrix alone -- confirmed by hitting an out-of-memory
+# std::bad_alloc at this exact step against the real data. None of the
+# steps that follow (FindMarkers in Section 13, SpatialFeaturePlot,
+# SpatialDimPlot, GSEA) read the scale.data slot -- they all default to
+# the "data" (normalized) slot -- so scaling every gene isn't actually
+# needed here. Falling back to Seurat's own default instead: scale only
+# the variable features already selected earlier in this section, which
+# is standard practice and >100x smaller (2,000 genes instead of
+# ~18,000).
+spatial <- ScaleData(spatial, assay = "Spatial.008um")
+```
+
+```{r merge-plots}
+merge_colors <- setNames(colorset[seq_along(levels(spatial$seurat_clusters))], levels(spatial$seurat_clusters))
+
+SpatialDimPlot(spatial, group.by = "seurat_clusters", cols = merge_colors, pt.size.factor = 4)
+ggsave(file.path(out_fig, "section7_merge/tumor_vs_normal_spatial_clusters.png"),
+       width = 14, height = 8, dpi = 300, bg = "white")
+
+DimPlot(spatial, reduction = "full.umap", group.by = c("condition", "seurat_clusters"),
+        cols = c(c("tumor" = "#fb2076", "normal_adjacent" = "#4deeea"), merge_colors))
+ggsave(file.path(out_fig, "section7_merge/tumor_vs_normal_umap_batch_check.png"),
+       width = 14, height = 6, dpi = 300, bg = "white")
+```
+
+Check that plot before moving on: if `tumor` and `normal_adjacent`
+occupy almost entirely disjoint clusters with no overlap anywhere, that
+can be genuine biology (tumor tissue really is transcriptionally
+distinct) but can also be a batch effect masquerading as biology --
+worth a second look at shared structures (e.g. do both samples get a
+smooth-muscle or vascular cluster in common?) before trusting the joint
+clustering downstream.
+
+## Section 8: Load the deconvolution reference
+
+Built once in `01_reference_prep.Rmd` from the Pelka et al. CRC atlas --
+see that notebook for how and why.
+
+```{r load-reference}
+ref_path_qs2 <- file.path(ref_dir, "crc_rctd_reference.qs2")
+ref_path_rds <- file.path(ref_dir, "crc_rctd_reference.rds")
+
+rctd_ref <- if (file.exists(ref_path_qs2)) {
+  qs2::qs_read(ref_path_qs2)
+} else if (file.exists(ref_path_rds)) {
+  readRDS(ref_path_rds)
+} else {
+  stop("Reference not found -- run 01_reference_prep.Rmd first.")
+}
+cat("Reference loaded:", length(rctd_ref@cell_types), "cells,",
+    nlevels(rctd_ref@cell_types), "cell types\n")
+```
+
+## Section 9: RCTD deconvolution
+
+```{r build-spatialrna}
+counts_spatial <- GetAssayData(spatial, assay = "Spatial.008um", layer = "counts")
+
+# GetTissueCoordinates() on a multi-image object silently returns
+# coordinates from only the FIRST image if you call it without naming
+# one -- pull coordinates per image explicitly and rbind them, rather
+# than trusting the single-image-shaped default.
+coords_list <- lapply(Images(spatial), function(img) {
+  GetTissueCoordinates(spatial, image = img)[, c("x", "y")]
+})
+coords <- do.call(rbind, coords_list)
+
+cat("Coordinate rows recovered per image:\n")
+print(sapply(coords_list, nrow))
+cat("Tumor bins in coords:  ", sum(grepl("^P5_Tumor_", rownames(coords))), "\n")
+cat("Normal bins in coords: ", sum(grepl("^P5_NormalAdjacent_", rownames(coords))), "\n")
+
+# Align explicitly by name rather than assuming row/column order already
+# matches -- coords came from rbind-ing per-image lookups in Images()
+# order, counts_spatial's columns are in the merged object's own order;
+# nothing guarantees those orders coincide.
+coords <- coords[colnames(counts_spatial), ]
+
+nUMI_spatial <- colSums(counts_spatial)
+puck <- SpatialRNA(coords, counts_spatial, nUMI_spatial)
+```
+
+```{r run-rctd}
+# doublet_mode: 'full' (many cell types per spot) is RCTD's usual choice
+# for standard Visium, where each ~55um spot covers roughly 1-10 cells.
+# An 8um Visium HD bin is much closer to single-cell scale -- often
+# covering part of one cell rather than several -- so 'doublet' mode
+# (which fits at most two cell types per bin) is the better-matched
+# assumption here, and considerably cheaper to run across the ~100K-800K
+# bins in this merged object. If you have the compute budget and want to
+# compare, 'full' remains a reasonable alternative to test against.
+# RCTD spins up one PSOCK worker per core and ships a chunk of the puck
+# to each; workers that hit a sparse->dense coercion on a gene x bin
+# matrix can each allocate multiple GB at once (a "sparse->dense
+# coercion: allocating vector of size 3.2 GiB" warning showed up directly
+# during this run). At max(1, detectCores() - 1) -- 27 workers on a
+# 28-core machine -- that pushed total memory demand past available RAM
+# (64GB, confirmed with
+# `system('powershell -Command "(Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory"')`,
+# since Windows' own `memory.limit()` is deprecated and `wmic` was not
+# available on this build) and crashed with `Error in serialize(data,
+# node$con) : error writing to connection` -- a known PSOCK failure mode
+# when workers collectively exhaust memory, not a problem with the data
+# or the RCTD call itself. Capping at 4 workers fixed it: same puck, same
+# reference, ran to completion. This trades away some parallel speed for
+# headroom -- on a machine with more RAM to spare, raising max_cores back
+# up (e.g. to `parallel::detectCores() - 1`) is a reasonable thing to try.
+max_cores <- min(4, max(1, parallel::detectCores() - 1))
+myRCTD <- create.RCTD(puck, rctd_ref, max_cores = max_cores,
+                       test_mode = FALSE)
+myRCTD <- run.RCTD(myRCTD, doublet_mode = "doublet")
+
+rctd_spot_ids <- rownames(myRCTD@results$weights)
+cat("RCTD output bins - Tumor:", sum(grepl("^P5_Tumor_", rctd_spot_ids)),
+    " Normal:", sum(grepl("^P5_NormalAdjacent_", rctd_spot_ids)), "\n")
+
+# RCTD's output covers fewer bins than went in (630,682 of 917,346 here,
+# about 69%) -- not a crash or data loss. create.RCTD() defaults to
+# UMI_min = 100 and silently drops any bin below that total-count floor
+# before fitting ever starts. Confirmed directly against this run's data,
+# not assumed: length(myRCTD@spatialRNA@nUMI) == 630682, matching
+# sum(nUMI_spatial < 100) == 286664 exactly (917346 - 630682). An 8um
+# bin is small enough that a large share of both sections -- background,
+# inter-cellular gaps, tissue edges -- genuinely has too few transcripts
+# captured to deconvolve reliably, so this floor is doing its job rather
+# than discarding usable signal. Downstream, AddMetaData() (next chunk)
+# leaves the excluded bins' cell-type columns as NA, and every later
+# step that depends on them (the epithelial ROI in Section 12 in
+# particular) naturally drops NA rows rather than needing a manual fix.
+```
+
+```{r save-rctd}
+saveRDS(myRCTD, file.path(out_rdata, "rctd_results.rds"))
+weights <- normalize_weights(myRCTD@results$weights)
+spatial <- AddMetaData(spatial, metadata = as.data.frame(as.matrix(weights)))
+saveRDS(spatial, file.path(out_rdata, "spatial_deconvoluted.rds"))
+cat("Deconvoluted cell types:", ncol(weights), "\n")
+colnames(weights)
+```
+
+## Section 10: Visualizing the deconvolution
+
+```{r decon-top-types}
+mean_weights <- colMeans(as.matrix(weights))
+top_cell_types <- names(sort(mean_weights, decreasing = TRUE))[1:min(6, length(mean_weights))]
+cat("Top 6 most abundant cell types overall:\n")
+print(sort(mean_weights, decreasing = TRUE)[1:6])
+
+p_spatial <- SpatialFeaturePlot(spatial, features = top_cell_types, pt.size.factor = 3,
+                                 alpha = c(0.1, 1), ncol = 3) & theme(legend.position = "right")
+p_spatial
+ggsave(file.path(out_fig, "deconvolution/top_celltypes_spatial.png"),
+       plot = p_spatial, width = 14, height = 9, dpi = 300, bg = "white")
+```
+
+```{r decon-composition-bar}
+df_comp <- data.frame(CellType = names(mean_weights), Proportion = mean_weights) %>%
+  arrange(desc(Proportion))
+
+# slice_head(n = 20) is a display cap, not an assumption that there are
+# 20 -- this reference has 7 broad cell types (see Section 8), so the
+# title below reflects however many actually get plotted rather than
+# hard-coding a number that would make a 7-bar chart look mislabeled.
+n_shown <- min(20, nrow(df_comp))
+p_bar <- df_comp %>%
+  slice_head(n = n_shown) %>%
+  ggplot(aes(x = reorder(CellType, Proportion), y = Proportion, fill = CellType)) +
+  geom_col(show.legend = FALSE) +
+  coord_flip() +
+  theme_minimal() +
+  labs(title = paste0("Top ", n_shown, " Cell-Type Proportions (P5 Tumor + Normal-Adjacent)"),
+       x = "Cell Type", y = "Mean Proportion")
+p_bar
+ggsave(file.path(out_fig, "deconvolution/celltype_composition_top20.png"),
+       plot = p_bar, width = 8, height = 7, dpi = 300, bg = "white")
+```
+
+## Section 11: Scatterpie visualization
+
+```{r scatterpie-prep}
+# This reference has 7 broad cell types (see Section 8), fewer than the
+# 10 originally hard-coded here. names(sorted_vec)[1:10] against a
+# length-7 vector doesn't error -- it silently pads with 3 NAs, which
+# then propagate into a real column of the pie-chart matrix and poison
+# rowSums()/normalization (every row becomes NA) a few steps down. Caught
+# by checking the actual cell-type count rather than assuming it, same as
+# the equivalent `min(6, length(mean_weights))` guard two chunks up.
+top_n_pie <- min(10, length(mean_weights))
+top_types_pie <- names(sort(mean_weights, decreasing = TRUE))[1:top_n_pie]
+weights_df <- as.data.frame(as.matrix(weights))
+safe_names <- make.names(top_types_pie)
+name_lookup <- setNames(top_types_pie, safe_names)
+
+other_weight <- rowSums(weights_df[, !colnames(weights_df) %in% top_types_pie, drop = FALSE])
+pie_weights <- weights_df[, top_types_pie, drop = FALSE]
+colnames(pie_weights) <- safe_names
+pie_weights$Other <- other_weight
+pie_cell_type_cols <- c(safe_names, "Other")
+
+coords_mat <- as.matrix(coords[rownames(pie_weights), c("x", "y")])
+colnames(coords_mat) <- c("imagecol", "imagerow")
+```
+
+```{r scatterpie-plot}
+y_mat <- as.matrix(pie_weights[, pie_cell_type_cols])
+y_mat <- y_mat / rowSums(y_mat)
+
+# With 100K+ bins, a scatterpie of every single one is unreadable (and
+# very slow to render) -- subsample for the plot. This is purely a
+# visualization decision; the deconvolution itself above used every bin.
+plot_idx <- sample(seq_len(nrow(y_mat)), size = min(8000, nrow(y_mat)))
+
+p_scatterpie <- SPOTlight::plotSpatialScatterpie(
+  x = coords_mat[plot_idx, ], y = y_mat[plot_idx, ],
+  cell_types = colnames(y_mat), pie_scale = 0.3
+) +
+  scale_fill_manual(
+    values = setNames(c(colorset[1:top_n_pie], "grey80"), pie_cell_type_cols),
+    labels = c(name_lookup, "Other" = "Other")
+  ) +
+  coord_fixed() + theme_void() +
+  labs(title = paste0("Cell-Type Composition per Bin (Top ", top_n_pie, " + Other, 8,000-bin subsample)"),
+       fill = "Cell Type")
+p_scatterpie
+ggsave(file.path(out_fig, "deconvolution/scatterpie_top10.png"),
+       plot = p_scatterpie, width = 10, height = 9, dpi = 300, bg = "white")
+```
+
+## Section 12: Defining a region of interest -- epithelial-enriched bins
+
+The reference pipeline this project is modeled on subset to a named
+anatomical region (isocortex, identified by cluster number) before
+running its tumor-analog comparison. Cluster numbers are unstable across
+reruns and resolutions, so rather than hard-coding cluster IDs, we define
+the region of interest directly from what Section 9's deconvolution
+already told us: which bins are predominantly epithelial. That's also
+the more biologically direct comparison for a tumor/normal question --
+epithelium is where colorectal cancer originates, and comparing
+epithelium-to-epithelium avoids diluting the signal with stromal and
+immune bins that both conditions share for unrelated reasons.
+
+```{r define-roi}
+# Matching "epithel" would never hit anything here: this reference's top-
+# level labels (Section 8) are short codes -- "Epi", not "Epithelial" --
+# so a pattern longer than the label itself can't match as a substring.
+# "epi" (case-insensitive) matches this reference's "Epi" directly and
+# would also match a spelled-out "Epithelial"/"epithelium" label from a
+# different reference, without colliding with any of this reference's
+# other 6 categories (B, Mast, Myeloid, Plasma, Strom, TNKILC).
+epi_types <- grep("epi", colnames(weights), ignore.case = TRUE, value = TRUE)
+cat("Cell type columns matched as epithelial:", paste(epi_types, collapse = ", "), "\n")
+
+stopifnot(
+  "No column name matched 'epi' -- print colnames(weights) (see \
+   Section 9) and set `epi_types` to the right cell-type column(s) by hand." =
+    length(epi_types) > 0
+)
+
+spatial$epithelial_weight <- rowSums(as.matrix(spatial@meta.data[, epi_types, drop = FALSE]))
+
+SpatialFeaturePlot(spatial, features = "epithelial_weight", pt.size.factor = 3) &
+  scale_fill_viridis_c()
+ggsave(file.path(out_fig, "roi/epithelial_weight_spatial.png"), width = 14, height = 8, dpi = 300, bg = "white")
+
+roi <- subset(spatial, subset = epithelial_weight >= 0.5)
+cat("Epithelial ROI:", ncol(roi), "bins (from", ncol(spatial), "total)\n")
+table(roi$condition)
+```
+
+```{r roi-composition}
+SpatialDimPlot(spatial, cells.highlight = colnames(roi), facet.highlight = TRUE, pt.size.factor = 3) +
+  ggtitle("Epithelial ROI (weight >= 0.5) highlighted")
+ggsave(file.path(out_fig, "roi/roi_highlighted.png"), width = 14, height = 8, dpi = 300, bg = "white")
+```
+
+## Section 13: Differential expression -- tumor vs. normal-adjacent epithelium
+
+Using the `Spatial.008um` assay rather than `SCT` here, deliberately: SCT's
+normalization/regression parameters were each fit per-sample, so
+`SCT`-assay values from two different samples aren't on directly
+comparable scales the way a shared log-normalization is. `Spatial.008um`
+was normalized once, jointly, across the merged object (end of Section
+7), which is what makes an across-sample comparison like this valid.
+
+```{r de-analysis}
+dir.create(file.path(out_fig, "de_gsea"), recursive = TRUE, showWarnings = FALSE)
+
+bad_genes_spatial <- rownames(spatial)[str_detect(rownames(spatial), "^A[CL][0-9]{5,6}\\.[0-9]+$")]
+genes_we_like_spatial <- setdiff(rownames(spatial), bad_genes_spatial)
+
+DefaultAssay(roi) <- "Spatial.008um"
+roi_degs <- FindMarkers(
+  roi, ident.1 = "tumor", ident.2 = "normal_adjacent", group.by = "condition",
+  min.pct = 0.1, logfc.threshold = 0.25, assay = "Spatial.008um",
+  features = genes_we_like_spatial
+) %>% rownames_to_column(var = "gene")
+
+cat("DE genes tested (tumor vs. normal-adjacent, epithelial ROI):", nrow(roi_degs), "\n")
+cat("Significant (p_val_adj <= 0.05):", sum(roi_degs$p_val_adj <= 0.05), "\n")
+```
+
+```{r de-top-hits}
+roi_degs %>% filter(p_val_adj <= 0.05) %>% arrange(desc(avg_log2FC)) %>% slice_head(n = 10) %>% print()
+roi_degs %>% filter(p_val_adj <= 0.05) %>% arrange(avg_log2FC) %>% slice_head(n = 10) %>% print()
+
+write.csv(roi_degs, file.path(out_fig, "de_gsea/roi_degs_tumor_vs_normal.csv"), row.names = FALSE)
+```
+
+```{r de-spatial-plot}
+top_deg_gene <- roi_degs %>% filter(p_val_adj <= 0.05) %>% slice_min(order_by = p_val_adj, n = 1) %>% pull(gene)
+if (length(top_deg_gene) > 0) {
+  cat("Top DE gene (tumor vs. normal-adjacent, epithelial ROI):", top_deg_gene, "\n")
+  SpatialFeaturePlot(roi, features = top_deg_gene, pt.size.factor = 3)
+  ggsave(file.path(out_fig, paste0("de_gsea/roi_", top_deg_gene, "_spatial.png")),
+         width = 10, height = 8, dpi = 300, bg = "white")
+}
+```
+
+## Section 14: Gene set enrichment analysis (GSEA)
+
+```{r gsea-genesets}
+go_bp <- msigdbr(species = "Homo sapiens", category = "C5", subcategory = "GO:BP") %>%
+  split(x = .$gene_symbol, f = .$gs_name)
+hallmark <- msigdbr(species = "Homo sapiens", category = "H") %>%
+  split(x = .$gene_symbol, f = .$gs_name)
+genesets <- c(go_bp, hallmark)
+cat("Total gene sets loaded:", length(genesets), "\n")
+```
+
+```{r gsea-ranking}
+# GSEA is a whole-list, rank-based method -- it needs the full distribution
+# of effect sizes across every gene that was tested, not just the ones
+# that already cleared a significance bar, to compute a meaningful
+# enrichment score and a valid permutation null. Ranking on only the
+# significant subset shrinks the gene universe down to a handful of
+# already-interesting genes, which undermines exactly the comparison
+# fgsea is designed to make (is this pathway enriched among genes ranked
+# by effect size, relative to what's expected by chance across the whole
+# tested set?). We rank on every gene FindMarkers returned above --
+# i.e. everything that passed its min.pct/logfc.threshold expression
+# filters, not only the ones with p_val_adj <= 0.05.
+cat("Genes going into the GSEA ranking (all DE-tested genes):", nrow(roi_degs), "\n")
+cat("...of which significant at p_val_adj <= 0.05:", sum(roi_degs$p_val_adj <= 0.05), "\n")
+
+gsea_ranks <- roi_degs %>%
+  arrange(desc(avg_log2FC)) %>%
+  dplyr::select(gene, avg_log2FC) %>%
+  deframe()
+```
+
+```{r gsea-run}
+gsea_res <- fgseaMultilevel(genesets, gsea_ranks, minSize = 15, maxSize = 500) %>%
+  arrange(padj)
+
+cat("Pathways tested:", nrow(gsea_res), "\n")
+cat("Significant pathways (padj <= 0.2):", sum(gsea_res$padj <= 0.2, na.rm = TRUE), "\n")
+
+fwrite(gsea_res[, !"leadingEdge"], file.path(out_fig, "de_gsea/roi_gsea_results.csv"))
+```
+
+```{r gsea-dotplot}
+gsea_res_small <- gsea_res %>%
+  filter(padj <= 0.2) %>%
+  slice_min(order_by = padj, n = 20, with_ties = FALSE) %>%
+  mutate(type = ifelse(NES < 0, "downregulated in tumor", "upregulated in tumor"),
+         NES = abs(NES),
+         pathway = gsub("_", " ", pathway)) %>%
+  filter(!is.na(pathway), !is.na(padj))
+
+if (nrow(gsea_res_small) > 0) {
+  p_gsea <- ggplot(gsea_res_small, aes(x = NES, y = fct_reorder(pathway, NES))) +
+    geom_point(aes(size = size, color = padj)) +
+    scale_color_gradient2(high = "#762A83", mid = "#f7f7f7", low = "#1B7837", midpoint = 0.05) +
+    ylab(NULL) + xlab("Absolute Value NES") +
+    scale_y_discrete(labels = function(x) str_wrap(x, width = 50)) +
+    ggtitle("Epithelial ROI GSEA: Tumor vs. Normal-Adjacent (Patient P5)") +
+    theme_bw(base_size = 11) +
+    facet_grid(. ~ type) +
+    theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+          strip.background = element_rect(fill = "white"))
+  p_gsea
+  ggsave(file.path(out_fig, "de_gsea/roi_gsea_dotplot.png"), plot = p_gsea, width = 12, height = 8, dpi = 300, bg = "white")
+} else {
+  cat("No pathways passed padj <= 0.2 threshold -- nothing to plot.\n")
+}
+```
+
+## Wrap-up
+
+At this point `output/rdata/spatial_deconvoluted.rds` holds the fully
+processed, deconvoluted, merged object, and `output/figures/` +
+`output/figures/de_gsea/` hold every figure and results table generated
+above. `docs/fastq_primer.md` covers what's further upstream of all of
+this, if you want to follow the chain back to raw sequencer output.

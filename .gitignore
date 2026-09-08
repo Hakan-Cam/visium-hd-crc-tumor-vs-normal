@@ -1,0 +1,27 @@
+# Raw and intermediate data -- large (100MB-1GB+ files), publicly
+# re-downloadable via download_data.sh, so it doesn't belong in git.
+data/
+!data/toy_fastq/
+!data/toy_fastq/*.gz
+
+# Generated figures, RDS/qs2 objects, DE/GSEA tables
+output/
+
+# R session cruft
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+
+# Rendered notebook output (keep the .Rmd source; regenerate the rest) --
+# but keep authored docs (README.md, docs/*.md) and the RStudio project file
+*.html
+*.md
+!README.md
+!docs/*.md
+analysis/*_cache/
+analysis/*_files/
+
+# OS cruft
+.DS_Store
+Thumbs.db
